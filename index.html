@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" type="text/css" href="css/styles.css">
+
+    <title>Sky Overlay with Homography & Glitch Noise</title>
+    <style>
+        /* canvas を画面全体に表示 */
+        body,
+        html {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background: black;
+        }
+
+        canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            z-index: 1;
+        }
+
+        /* video は非表示 */
+        video {
+            display: none;
+        }
+    </style>
+</head>
+
+<body>
+    <!-- ボタンはこのように配置 -->
+    <button id="toggleFeatures">特徴量表示切替</button>
+    <!-- カメラ映像取得用 video（非表示） -->
+    <video id="video" autoplay playsinline></video>
+    <!-- 描画用 canvas -->
+    <canvas id="canvas"></canvas>
+
+    <!-- 他の要素の後、もしくは適切な位置にボタンを追加 -->
+    <!-- index.html の例 -->
+    <!--<button id="toggleFeatures" style="position: absolute; top: 10px; right: 10px; z-index: 1000;">
+    特徴量表示切替
+  </button>
+-->
+
+
+    <!-- OpenCV.js の読み込み -->
+
+    <script async src="https://docs.opencv.org/4.5.5/opencv.js" onload="onOpenCvReady();"></script>
+    <script>
+        /**********************
+         * パラメータ設定
+         **********************/
+        // 青空と判定するための青チャンネル閾値（数値を変更して調整）
+        let blueThreshold = 150;
+        let whiteThreshold = 150;
+        // 特徴点抽出パラメータ
+        const maxCorners = 100;
+        const qualityLevel = 0.01;
+        const minDistance = 10;
+
+        // 特徴量および連結線を表示するかどうかを管理するフラグ
+        let displayFeatures = false; // false にすれば非表示、true にすれば表示
+
+
+        let overlayVisible = false;
+
+        /**********************
+         * グローバル変数
+         **********************/
+        let video = document.getElementById('video');
+        let canvas = document.getElementById('canvas');
+        let ctx = canvas.getContext('2d');
+
+        // 重ねる画像（適宜ご用意ください）
+        let overlayImage = new Image();
+        overlayImage.src = 'overlay.png';
+        // 初期表示位置（タップすると変更されます）
+        let overlayPos = { x: 100, y: 100 };
+
+        // Optical Flow 用の参照画像・特徴点
+        let refPoints = null;  // cv.Mat 型（各行が [x,y]）
+        let prevGray = null;   // 前フレームのグレースケール画像
+        let trackingInitialized = false;
+
+        // 安定化用（低域通過フィルタ）の変位ベクトル
+        let filteredDisp = { x: 0, y: 0 };
+        const alphaFilter = 0.8; // 直前の値の重み
+
+
+        const glitchIntensity = 0.1;
+
+        /**********************
+         * 初期化
+         **********************/
+        function onOpenCvReady() {
+            // カメラ映像の取得開始
+            startCamera();
+        }
+
+        function startCamera() {
+            navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false })
+                .then(function (stream) {
+                    video.srcObject = stream;
+                    video.onloadedmetadata = function () {
+                        video.play();
+                        // canvas サイズを映像サイズに合わせる
+                        canvas.width = video.videoWidth;
+                        canvas.height = video.videoHeight;
+                        requestAnimationFrame(processFrame);
+                    }
+                })
+                .catch(function (err) {
+                    console.error("カメラ取得エラー: " + err);
+                });
+        }
+
+        /**********************
+         * フレーム処理ループ
+         **********************/
+        function processFrame() {
+            if (video.readyState !== video.HAVE_ENOUGH_DATA) {
+                requestAnimationFrame(processFrame);
+                return;
+            }
+
+            // 1. カメラ映像を canvas に描画
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+            // 2. 映像全体のイメージデータを取得（後述の青空マスク作成用）
+            let frameData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+            // 3. OpenCV を用いた Optical Flow 処理
+            if (cv && canvas.width && canvas.height) {
+                // 現在のフレームを cv.Mat に読み込み
+                let src = cv.imread(canvas);
+                let gray = new cv.Mat();
+                cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+
+                if (!trackingInitialized) {
+                    // ※初回またはタップにより再初期化された場合
+                    let corners = new cv.Mat();
+                    let mask = new cv.Mat();
+                    cv.goodFeaturesToTrack(gray, corners, maxCorners, qualityLevel, minDistance, mask, 3, false, 0.04);
+                    refPoints = corners.clone();
+                    trackingInitialized = true;
+                    // 前フレームを保存
+                    if (prevGray) { prevGray.delete(); }
+                    prevGray = gray.clone();
+                    mask.delete();
+                    corners.delete();
+                } else {
+                    // 前フレーム（prevGray）と現在フレーム（gray）から、参照点の追跡を行う
+                    let nextPts = new cv.Mat();
+                    let status = new cv.Mat();
+                    let err = new cv.Mat();
+                    cv.calcOpticalFlowPyrLK(prevGray, gray, refPoints, nextPts, status, err);
+
+                    // 追跡できた各点について、基準点（黄色）と現在の位置（赤）を描画し、青線で結ぶ
+                    let sumDx = 0, sumDy = 0, count = 0;
+                    for (let i = 0; i < status.rows; i++) {
+                        if (status.data[i] === 1) {
+                            let x0 = refPoints.data32F[i * 2];
+                            let y0 = refPoints.data32F[i * 2 + 1];
+                            let x1 = nextPts.data32F[i * 2];
+                            let y1 = nextPts.data32F[i * 2 + 1];
+                            sumDx += (x1 - x0);
+                            sumDy += (y1 - y0);
+                            count++;
+
+                            // displayFeatures フラグが true の場合のみ描画
+                            if (displayFeatures) {
+                                // 基準点（黄色）
+                                ctx.fillStyle = 'yellow';
+                                ctx.beginPath();
+                                ctx.arc(x0, y0, 3, 0, 2 * Math.PI);
+                                ctx.fill();
+
+                                // 現在の特徴点（赤）
+                                ctx.fillStyle = 'red';
+                                ctx.beginPath();
+                                ctx.arc(x1, y1, 3, 0, 2 * Math.PI);
+                                ctx.fill();
+
+                                // 両点を結ぶ青い線
+                                ctx.strokeStyle = 'blue';
+                                ctx.beginPath();
+                                ctx.moveTo(x0, y0);
+                                ctx.lineTo(x1, y1);
+                                ctx.stroke();
+                            }
+                        }
+                    }
+
+                    if (count > 0) {
+                        let avgDx = sumDx / count;
+                        let avgDy = sumDy / count;
+                        // 低域通過フィルタにより、細かい揺れを抑制
+                        filteredDisp.x = alphaFilter * filteredDisp.x + (1 - alphaFilter) * avgDx;
+                        filteredDisp.y = alphaFilter * filteredDisp.y + (1 - alphaFilter) * avgDy;
+                        // カメラの動きに合わせて重ねる画像の位置を更新（＝世界座標に固定されるかのように）
+                        overlayPos.x += filteredDisp.x;
+                        overlayPos.y += filteredDisp.y;
+                    }
+
+                    // 次フレームのため、参照点・前フレーム画像を更新
+                    refPoints.delete();
+                    refPoints = nextPts.clone();
+                    prevGray.delete();
+                    prevGray = gray.clone();
+
+                    status.delete();
+                    err.delete();
+                    nextPts.delete();
+                }
+
+                src.delete();
+                gray.delete();
+            }
+
+            // 4. 青空マスクの作成
+            // 各ピクセルごとに、青の値が一定以上かつ赤・緑より低い場合に「青空」と判定
+            /*    let maskCanvas = document.createElement('canvas');
+                maskCanvas.width = canvas.width;
+                maskCanvas.height = canvas.height;
+                let maskCtx = maskCanvas.getContext('2d');
+                let maskImgData = maskCtx.createImageData(canvas.width, canvas.height);
+                for (let i = 0; i < frameData.data.length; i += 4) {
+                  let r = frameData.data[i];
+                  let g = frameData.data[i+1];
+                  let b = frameData.data[i+2];
+                  // 簡易判定：b が blueThreshold 以上かつ r, g よりも十分低い
+                  
+                  if (b > blueThreshold && b > r + 20 && b > g + 20) {
+                    maskImgData.data[i] = 255;
+                    maskImgData.data[i+1] = 255;
+                    maskImgData.data[i+2] = 255;
+                    maskImgData.data[i+3] = 255;
+                  } else {
+                    maskImgData.data[i+3] = 0;
+                  }
+                }*/
+
+            // 4. 白い壁マスクの作成
+            // 各ピクセルごとに、R, G, BすべてがwhiteThreshold以上の場合に「白い壁」と判定
+            let maskCanvas = document.createElement('canvas');
+            maskCanvas.width = canvas.width;
+            maskCanvas.height = canvas.height;
+            let maskCtx = maskCanvas.getContext('2d');
+            let maskImgData = maskCtx.createImageData(canvas.width, canvas.height);
+            for (let i = 0; i < frameData.data.length; i += 4) {
+                let r = frameData.data[i];
+                let g = frameData.data[i + 1];
+                let b = frameData.data[i + 2];
+                // 白い壁と判定する条件。必要に応じて「近似的な白」を判定するための条件（例えば差が小さいなど）を追加してもよい
+                if (r > whiteThreshold && g > whiteThreshold && b > whiteThreshold) {
+                    maskImgData.data[i] = 255;
+                    maskImgData.data[i + 1] = 255;
+                    maskImgData.data[i + 2] = 255;
+                    maskImgData.data[i + 3] = 255;
+                } else {
+                    maskImgData.data[i + 3] = 0;
+                }
+            }
+            maskCtx.putImageData(maskImgData, 0, 0);
+
+            maskCtx.putImageData(maskImgData, 0, 0);
+
+            // 5. 重ねる画像の描画（青空部分のみ合成）
+            // 一旦別の canvas に重ねる画像を描画
+            /*
+            let overlayCanvas = document.createElement('canvas');
+            overlayCanvas.width = canvas.width;
+            overlayCanvas.height = canvas.height;
+            let overlayCtx = overlayCanvas.getContext('2d');
+            overlayCtx.clearRect(0, 0, canvas.width, canvas.height);
+            // 現在の overlayPos に画像を描画
+            overlayCtx.drawImage(overlayImage, overlayPos.x, overlayPos.y);
+            // マスクを適用するため、globalCompositeOperation を変更
+            overlayCtx.globalCompositeOperation = 'destination-in';
+            overlayCtx.drawImage(maskCanvas, 0, 0);
+            overlayCtx.globalCompositeOperation = 'source-over';
+            // 合成した overlayCanvas を元の canvas に描画
+            ctx.drawImage(overlayCanvas, 0, 0);
+            */
+
+            if (overlayVisible) {
+                let overlayCanvas = document.createElement('canvas');
+                overlayCanvas.width = canvas.width;
+                overlayCanvas.height = canvas.height;
+                let overlayCtx = overlayCanvas.getContext('2d');
+                overlayCtx.clearRect(0, 0, canvas.width, canvas.height);
+                overlayCtx.drawImage(overlayImage, overlayPos.x, overlayPos.y);
+                overlayCtx.globalCompositeOperation = 'destination-in';
+                overlayCtx.drawImage(maskCanvas, 0, 0);
+                overlayCtx.globalCompositeOperation = 'source-over';
+                ctx.drawImage(overlayCanvas, 0, 0);
+            }
+
+            // 6. グリッチノイズの追加
+            addGlitchNoise(ctx, canvas.width, canvas.height, glitchIntensity);
+//            addGlitchNoise(ctx, canvas.width, canvas.height);
+            requestAnimationFrame(processFrame);
+        }
+
+        function adjustCanvasSize() {
+            // CSS上の表示サイズをウィンドウサイズに合わせる
+            const displayWidth = window.innerWidth;
+            const displayHeight = window.innerHeight;
+
+            // デバイスピクセル比を考慮して内部解像度を設定
+            const scale = window.devicePixelRatio || 1;
+            canvas.width = displayWidth * scale;
+            canvas.height = displayHeight * scale;
+
+            // CSSでの表示サイズはそのままウィンドウサイズにする
+            canvas.style.width = displayWidth + "px";
+            canvas.style.height = displayHeight + "px";
+        }
+        adjustCanvasSize();
+        window.addEventListener('resize', adjustCanvasSize);
+
+        /**********************
+         * グリッチノイズ関数
+         * 横方向のスライスをランダムにシフトして、古いテレビ風のノイズを付加します。
+         **********************/
+
+
+//        function addGlitchNoise(ctx, width, height, intensity) {
+/*
+        function addGlitchNoise(ctx, width, height) {
+
+            // グリッチノイズの強さ（0～1 の範囲、数値が大きいほどノイズが多い）
+            const intensity = 0.104;
+            const glitchMaxShift = 20;
+
+
+            // ノイズの振幅（例: intensity により変化）
+            const amplitude = intensity * 10;
+            // 波の周波数（ここは横方向の変化）
+            const frequency = 0.1;
+            // 各スライスの高さ（細かいスライスで連続性を出す）
+            const sliceHeight = 2;
+            // 波の上下するスピードを調整する変数（値を変更して速度を調整）
+            const waveSpeed = 15.0;
+            // 現在の時間（秒単位）
+            const time = performance.now() / 1000;
+
+            for (let y = 0; y < height; y += sliceHeight) {
+                // サイン波を利用して滑らかな横方向のずれを計算
+                let offset = amplitude * Math.sin(frequency * y + waveSpeed * time);
+                try {
+                    let slice = ctx.getImageData(0, y, width, sliceHeight);
+                    ctx.clearRect(0, y, width, sliceHeight);
+                    ctx.putImageData(slice, offset, y);
+                } catch (e) {
+                    console.error(e);
+                }
+            }
+
+
+            for (let y = 0; y < height; y += sliceHeight) {
+                // サイン波によるなめらかなオフセット。y に対して連続的に変化するので、エッジが急激ではなく滑らかになります。
+                // time を加えることで、動的に変化する波状エフェクトにできます。
+                let offset = amplitude * Math.sin(frequency * y + time);
+                try {
+                    let slice = ctx.getImageData(0, y, width, sliceHeight);
+                    // 該当部分をクリア
+                    ctx.clearRect(0, y, width, sliceHeight);
+                    // オフセットを適用して再描画（x方向にずらす）
+                    ctx.putImageData(slice, offset, y);
+                } catch (e) {
+                    console.error(e);
+                }
+            }
+        }
+*/
+
+        function addGlitchNoise(ctx, width, height, intensity) {
+            // intensity に応じたスライス数
+            const numSlices = Math.floor(intensity * 50);
+            for (let i = 0; i < numSlices; i++) {
+                let sliceHeight = Math.floor(Math.random() * 10) + 1;
+                let y = Math.floor(Math.random() * height);
+                let shift = Math.floor((Math.random() - 0.5) * 20);
+                try {
+                    let slice = ctx.getImageData(0, y, width, sliceHeight);
+                    ctx.clearRect(0, y, width, sliceHeight);
+                    ctx.putImageData(slice, shift, y);
+                } catch (e) {
+                    console.error(e);
+                }
+            }
+        }
+
+
+
+
+
+        /*
+        function addGlitchNoise(ctx, width, height, intensity) {
+            // 向き情報を取得
+            let angle = 0;
+            if (screen.orientation && typeof screen.orientation.angle === 'number') {
+                angle = screen.orientation.angle;
+            } else if (typeof window.orientation === 'number') {
+                angle = window.orientation;
+            }
+        
+            // ここで、iPad固有の補正が必要なら条件分岐する
+            // 例: iPadで角度が -90 なら、補正して90度回転させる
+            // ※iPadのSafariでは、angleの値がデバイスによって異なる場合があるので、実機で確認してください。
+            let rotationCorrection = 0;
+            // 例として、iPadで-90の場合に補正を行う
+            if (angle === -90) {
+                rotationCorrection = 90;
+            }
+            // 合計の回転角度
+            let totalRotation = (angle + rotationCorrection) * Math.PI / 180;
+        
+            // 回転してグリッチを描画する
+            ctx.save();
+            ctx.translate(width / 2, height / 2);
+            ctx.rotate(totalRotation);
+            ctx.translate(-width / 2, -height / 2);
+        
+            const numSlices = Math.floor(intensity * 50);
+            for (let i = 0; i < numSlices; i++) {
+                let sliceHeight = Math.floor(Math.random() * 10) + 1;
+                let y = Math.floor(Math.random() * height);
+                let shift = Math.floor((Math.random() - 0.5) * 20);
+                try {
+                    let slice = ctx.getImageData(0, y, width, sliceHeight);
+                    ctx.clearRect(0, y, width, sliceHeight);
+                    ctx.putImageData(slice, shift, y);
+                } catch (e) {
+                    console.error(e);
+                }
+            }
+        
+            ctx.restore();
+        }
+        */
+
+        /**********************
+                 * タップ（クリック）イベント
+                 * ・タップ位置を重ねる画像の初期位置に設定
+                 * ・次フレームから再度基準となる特徴点を取得（trackingInitialized フラグをリセット）
+                 **********************/
+        /*  canvas.addEventListener('click', function(e) {
+            const rect = canvas.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const y = e.clientY - rect.top;
+            // 再初期化フラグを立てる
+            trackingInitialized = false;
+            // 重ねる画像の初期位置を設定（既に描画中なら差し替え）
+            overlayPos = { x: x, y: y };
+          });
+         */
+        canvas.addEventListener('click', function (e) {
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = canvas.width / rect.width;
+            const scaleY = canvas.height / rect.height;
+
+            const x = (e.clientX - rect.left) * scaleX;
+            const y = (e.clientY - rect.top) * scaleY;
+
+            // 特徴点の再初期化などがあればここで実施
+            trackingInitialized = false;
+
+            // 画像の中心がタップ位置に来るようにオフセットを適用
+            overlayPos = {
+                x: x - overlayImage.width / 2,
+                y: y - overlayImage.height / 2
+            };
+
+            // タップ時にオーバーレイ画像を表示する
+            overlayVisible = true;
+        });
+        let deviceAngle = 0;
+        window.addEventListener("deviceorientation", function (event) {
+            // event.alpha, event.beta, event.gamma から適切な角度を選択
+            // ここでは単純な例として event.gamma を利用（デバイスの横回転を表す場合もあります）
+            // 実際には実機でどの値が最も安定しているか検証してください
+            deviceAngle = event.gamma || 0;
+        });
+
+        document.getElementById('toggleFeatures').addEventListener('click', function () {
+            displayFeatures = !displayFeatures;
+            console.log("特徴量表示:", displayFeatures);
+        });
+
+    </script>
+
+
+</body>
+
+</html>
