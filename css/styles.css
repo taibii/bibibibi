@@ -17,7 +17,7 @@ canvas {
   position: absolute; /* または fixed でも可 */
   top: 10px;
   right: 10px;
-  z-index: 0;
+  z-index: 10;
 }
 
 /* 古いカメラ風のフィルター例 */
