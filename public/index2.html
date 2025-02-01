@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>カメラ動作の可視化</title>
+    <script async src="https://docs.opencv.org/4.5.5/opencv.js" onload="cv.onRuntimeInitialized = onOpenCvReady;"></script>
+    <style>
+        body { text-align: center; font-family: Arial, sans-serif; margin: 0; overflow: hidden; }
+        video { display: none; }
+        canvas { width: 100vw; height: 100vh; position: absolute; top: 0; left: 0; }
+        #status, #movement, #tapPosition, #anchorStatus, #debugInfo {
+            position: absolute; left: 10px;
+            background: rgba(0, 0, 0, 0.5);
+            color: white; padding: 5px; font-size: 14px;
+            white-space: pre-wrap;
+        }
+        #status { top: 10px; }
+        #movement { top: 40px; }
+        #tapPosition { top: 70px; }
+        #anchorStatus { top: 100px; }
+        #debugInfo { top: 130px; max-width: 90vw; overflow-wrap: break-word; }
+    </style>
+</head>
+<body>
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="canvas"></canvas>
+    <p id="status">OpenCV.js のロード待機中...</p>
+    <p id="movement">移動量: X=0, Y=0</p>
+    <p id="tapPosition">タップ位置: X=0, Y=0</p>
+    <p id="anchorStatus">アンカー: ❌ 未設定</p>
+    <p id="debugInfo">デバッグ情報:</p>
+
+    <script>
+        let video = document.getElementById('video');
+        let canvas = document.getElementById('canvas');
+        let ctx = canvas.getContext('2d', { willReadFrequently: true });
+        let oldFrame = null;
+        let anchorKeypoints = null;
+        let anchorDescriptors = null;
+        let anchorPoints = [];
+        let lastTapPosition = { x: null, y: null };
+
+        const DISTANCE_THRESHOLD = 60;
+        const MAX_MATCHES = 100;
+        const MAX_ANCHOR_POINTS = 100;
+
+        function onOpenCvReady() {
+            console.log("✅ OpenCV.js のロード完了");
+            document.getElementById('status').innerText = "✅ OpenCV.js のロード完了";
+            startCamera();
+        }
+
+        async function startCamera() {
+            try {
+                let stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+                video.srcObject = stream;
+                video.onloadedmetadata = () => {
+                    video.play();
+                    canvas.width = video.videoWidth || 640;
+                    canvas.height = video.videoHeight || 480;
+                    requestAnimationFrame(processVideo);
+                };
+            } catch (err) {
+                console.error("カメラが使用できません: ", err);
+                document.getElementById('status').innerText = "❌ カメラのアクセスを許可してください";
+            }
+        }
+
+        function setAnchor(x, y) {
+            if (!oldFrame) {
+                console.warn("⚠️ oldFrame が null のため、特徴点を取得できません");
+                return;
+            }
+
+            //let orb = new cv.ORB(500);
+            let orb = new cv.ORB(500);
+            let keypoints = new cv.KeyPointVector();
+            let descriptors = new cv.Mat();
+            let mask = new cv.Mat.zeros(oldFrame.rows, oldFrame.cols, cv.CV_8UC1);
+            cv.circle(mask, new cv.Point(x, y), 30, new cv.Scalar(255), -1);
+
+            orb.detectAndCompute(oldFrame, mask, keypoints, descriptors);
+            mask.delete();
+
+            if (keypoints.size() > 0) {
+                anchorKeypoints = new cv.KeyPointVector();
+                anchorDescriptors = descriptors.clone();
+                anchorPoints = [];
+
+                for (let i = 0; i < Math.min(keypoints.size(), MAX_ANCHOR_POINTS); i++) {
+                    let kp = keypoints.get(i);
+                    anchorKeypoints.push_back(kp);
+                    anchorPoints.push({ x: kp.pt.x, y: kp.pt.y });
+                }
+
+                document.getElementById('status').innerText = "📍 アンカーセット";
+                document.getElementById('anchorStatus').innerText = "アンカー: ✅ 設定済み";
+                lastTapPosition = { x, y };
+                document.getElementById('tapPosition').innerText = `タップ位置: X=${x.toFixed(2)}, Y=${y.toFixed(2)}`;
+            } else {
+                document.getElementById('status').innerText = "⚠️ アンカーが設定できません";
+            }
+        }
+
+        function processVideo() {
+            if (typeof cv === "undefined" || !cv.Mat) {
+                requestAnimationFrame(processVideo);
+                return;
+            }
+
+            let frame = new cv.Mat(video.videoHeight, video.videoWidth, cv.CV_8UC4);
+            let gray = new cv.Mat();
+            let keypoints = new cv.KeyPointVector();
+            let descriptors = new cv.Mat();
+
+            try {
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+                let imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                frame.data.set(imageData.data);
+                cv.cvtColor(frame, gray, cv.COLOR_RGBA2GRAY);
+
+                if (!oldFrame) oldFrame = gray.clone();
+
+                let orb = new cv.ORB(500);
+                orb.detectAndCompute(gray, new cv.Mat(), keypoints, descriptors);
+
+                let movementInfo = [];
+
+                for (let i = 0; i < keypoints.size(); i++) {
+                    let kp = keypoints.get(i);
+                    ctx.fillStyle = "red";
+                    ctx.beginPath();
+                    ctx.arc(kp.pt.x, kp.pt.y, 3, 0, 2 * Math.PI);
+                    ctx.fill();
+                }
+
+                for (let point of anchorPoints) {
+                    ctx.fillStyle = "yellow";
+                    ctx.beginPath();
+                    ctx.arc(point.x, point.y, 4, 0, 2 * Math.PI);
+                    ctx.fill();
+                }
+
+                for (let point of anchorPoints) {
+                    let closest = keypoints.get(0);
+                    let minDist = Infinity;
+
+                    for (let i = 0; i < keypoints.size(); i++) {
+                        let kp = keypoints.get(i);
+                        let dist = Math.hypot(kp.pt.x - point.x, kp.pt.y - point.y);
+                        if (dist < minDist) {
+                            minDist = dist;
+                            closest = kp;
+                        }
+                    }
+
+                    if (minDist < DISTANCE_THRESHOLD) {
+                        ctx.strokeStyle = "blue";
+                        ctx.lineWidth = 2;
+                        ctx.beginPath();
+                        ctx.moveTo(point.x, point.y);
+                        ctx.lineTo(closest.pt.x, closest.pt.y);
+                        ctx.stroke();
+
+                        movementInfo.push(`移動量: X=${(closest.pt.x - point.x).toFixed(2)}, Y=${(closest.pt.y - point.y).toFixed(2)}`);
+                    }
+                }
+
+                document.getElementById('debugInfo').innerText = `デバッグ情報:\n` + movementInfo.join("\n");
+
+            } finally {
+                frame.delete();
+                keypoints.delete();
+                descriptors.delete();
+            }
+
+            requestAnimationFrame(processVideo);
+        }
+
+        canvas.addEventListener("click", (event) => setAnchor(event.clientX, event.clientY));
+        canvas.addEventListener("touchstart", (event) => setAnchor(event.touches[0].clientX, event.touches[0].clientY));
+
+    </script>
+</body>
+</html>

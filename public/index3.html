@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>カメラ動作の可視化（アンカー + 累積計算）</title>
+    <script async src="https://docs.opencv.org/4.5.5/opencv.js" onload="cv.onRuntimeInitialized = onOpenCvReady;"></script>
+    <style>
+        body { text-align: center; font-family: Arial, sans-serif; margin: 0; overflow: hidden; }
+        video { display: none; }
+        canvas { width: 100vw; height: 100vh; position: absolute; top: 0; left: 0; }
+        #status, #movement, #totalMovement, #anchorStatus, #debugInfo {
+            position: absolute; left: 10px;
+            background: rgba(0, 0, 0, 0.5);
+            color: white; padding: 5px; font-size: 14px;
+            white-space: pre-wrap;
+        }
+        #status { top: 10px; }
+        #movement { top: 40px; }
+        #totalMovement { top: 70px; }
+        #anchorStatus { top: 100px; }
+        #debugInfo { top: 130px; max-width: 90vw; overflow-wrap: break-word; }
+    </style>
+</head>
+<body>
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="canvas"></canvas>
+    <p id="status">OpenCV.js のロード待機中...</p>
+    <p id="movement">移動量: X=0.0, Y=0.0</p>
+    <p id="totalMovement">合計移動量: X=0.0, Y=0.0</p>
+    <p id="anchorStatus">アンカー: ❌ 未設定</p>
+    <p id="debugInfo">デバッグ情報:</p>
+
+    <script>
+        let video = document.getElementById('video');
+        let canvas = document.getElementById('canvas');
+        let ctx = canvas.getContext('2d', { willReadFrequently: true });
+        let oldFrame = null;
+        let anchorPoints = [];
+        let anchorDescriptors = null;
+        let lastFramePoints = [];
+        let lastFrameDescriptors = null;
+        let totalX = 0, totalY = 0;
+
+        // パラメータ設定
+        const DISTANCE_THRESHOLD = 50;  
+        const MAX_MATCHES = 100;        
+        const MAX_ANCHOR_POINTS = 100;  
+        const RANSAC_THRESHOLD = 3.0;
+        const ANCHOR_UPDATE_INTERVAL = 5000;  // 5秒ごとにアンカーを更新
+
+        function onOpenCvReady() {
+            document.getElementById('status').innerText = "✅ OpenCV.js のロード完了";
+            startCamera();
+            setInterval(setAnchor, ANCHOR_UPDATE_INTERVAL);  // 一定時間ごとにアンカー更新
+        }
+
+        async function startCamera() {
+            try {
+                let stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+                video.srcObject = stream;
+                video.onloadedmetadata = () => {
+                    video.play();
+                    canvas.width = video.videoWidth || 640;
+                    canvas.height = video.videoHeight || 480;
+                    requestAnimationFrame(processVideo);
+                };
+            } catch (err) {
+                document.getElementById('status').innerText = "❌ カメラのアクセスを許可してください";
+            }
+        }
+
+        function setAnchor() {
+            if (!oldFrame) return;
+
+            // 🔹 アンカーをリセットして画面全体の特徴点を取得
+            anchorPoints = [];
+            anchorDescriptors = new cv.Mat();
+
+            let orb = new cv.ORB(MAX_ANCHOR_POINTS);
+            let keypoints = new cv.KeyPointVector();
+            let descriptors = new cv.Mat();
+            orb.detectAndCompute(oldFrame, new cv.Mat(), keypoints, descriptors);
+
+            if (keypoints.size() > 0) {
+                for (let i = 0; i < Math.min(keypoints.size(), MAX_ANCHOR_POINTS); i++) {
+                    let kp = keypoints.get(i);
+                    anchorPoints.push({ x: kp.pt.x, y: kp.pt.y });
+                }
+                anchorDescriptors = descriptors.clone();
+                document.getElementById('anchorStatus').innerText = "アンカー: ✅ 更新済み";
+            }
+        }
+
+        function processVideo() {
+            if (typeof cv === "undefined" || !cv.Mat) {
+                requestAnimationFrame(processVideo);
+                return;
+            }
+
+            let frame = new cv.Mat(video.videoHeight, video.videoWidth, cv.CV_8UC4);
+            let gray = new cv.Mat();
+            let keypoints = new cv.KeyPointVector();
+            let descriptors = new cv.Mat();
+
+            try {
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+                let imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                frame.data.set(imageData.data);
+                cv.cvtColor(frame, gray, cv.COLOR_RGBA2GRAY);
+                if (!oldFrame) oldFrame = gray.clone();
+
+                let orb = new cv.ORB(MAX_MATCHES);
+                orb.detectAndCompute(gray, new cv.Mat(), keypoints, descriptors);
+
+                for (let i = 0; i < keypoints.size(); i++) {
+                    let kp = keypoints.get(i);
+                    ctx.fillStyle = "red";
+                    ctx.beginPath();
+                    ctx.arc(kp.pt.x, kp.pt.y, 3, 0, 2 * Math.PI);
+                    ctx.fill();
+                }
+
+                
+                for (let point of anchorPoints) {
+                    ctx.fillStyle = "yellow";
+                    ctx.beginPath();
+                    ctx.arc(point.x, point.y, 4, 0, 2 * Math.PI);
+                    ctx.fill();
+                }
+
+                let sumX = 0, sumY = 0, count = 0;
+                for (let i = 0; i < anchorPoints.length; i++) {
+                    let closest = keypoints.get(0);
+                    let minDist = Infinity;
+
+                    for (let j = 0; j < keypoints.size(); j++) {
+                        let kp = keypoints.get(j);
+                        let dist = Math.hypot(kp.pt.x - anchorPoints[i].x, kp.pt.y - anchorPoints[i].y);
+                        if (dist < minDist) {
+                            minDist = dist;
+                            closest = kp;
+                        }
+                    }
+
+                    if (minDist < DISTANCE_THRESHOLD) {
+                        sumX += closest.pt.x - anchorPoints[i].x;
+                        sumY += closest.pt.y - anchorPoints[i].y;
+                        count++;
+
+                        ctx.strokeStyle = "blue";
+                        ctx.lineWidth = 2;
+                        ctx.beginPath();
+                        ctx.moveTo(anchorPoints[i].x, anchorPoints[i].y);
+                        ctx.lineTo(closest.pt.x, closest.pt.y);
+                        ctx.stroke();
+                    }
+                }
+
+                if (count > 0) {
+                    totalX += sumX / count;
+                    totalY += sumY / count;
+                    document.getElementById('movement').innerText = `移動量: X=${(sumX / count).toFixed(1)}, Y=${(sumY / count).toFixed(1)}`;
+                    document.getElementById('totalMovement').innerText = `合計移動量: X=${totalX.toFixed(1)}, Y=${totalY.toFixed(1)}`;
+                }
+            } finally {
+                frame.delete();
+                keypoints.delete();
+                descriptors.delete();
+            }
+
+            requestAnimationFrame(processVideo);
+        }
+
+    </script>
+</body>
+</html>
