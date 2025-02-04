@@ -216,7 +216,7 @@
 
             // 4. 青空マスクの作成
             // 各ピクセルごとに、青の値が一定以上かつ赤・緑より低い場合に「青空」と判定
-            /*    let maskCanvas = document.createElement('canvas');
+                let maskCanvas = document.createElement('canvas');
                 maskCanvas.width = canvas.width;
                 maskCanvas.height = canvas.height;
                 let maskCtx = maskCanvas.getContext('2d');
@@ -235,8 +235,9 @@
                   } else {
                     maskImgData.data[i+3] = 0;
                   }
-                }*/
+                }
 
+            /*
             // 4. 白い壁マスクの作成
             // 各ピクセルごとに、R, G, BすべてがwhiteThreshold以上の場合に「白い壁」と判定
             let maskCanvas = document.createElement('canvas');
@@ -258,6 +259,7 @@
                     maskImgData.data[i + 3] = 0;
                 }
             }
+            */
             maskCtx.putImageData(maskImgData, 0, 0);
 
             maskCtx.putImageData(maskImgData, 0, 0);
